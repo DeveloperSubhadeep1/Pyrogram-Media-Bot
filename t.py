@@ -241,23 +241,130 @@ async def callbacks(c, cb: CallbackQuery):
         USER_STATE[uid] = {"action": "wait_thumb", "msg": msg}
         await cb.message.reply_text("🖼 **Send a Photo.**", reply_markup=ForceReply())
 
+# @app.on_message(filters.text & filters.private)
+# async def inputs(c, m):
+#     uid = m.from_user.id
+#     if uid not in USER_STATE: return
+    
+#     st = USER_STATE[uid]
+#     if st["action"] == "wait_name":
+#         path = WORKDIR / m.text.replace("/", "_")
+#         status = await m.reply_text("📝 **Renaming...**")
+#         try:
+#             await st["msg"].download(str(path))
+#             await m.reply_document(str(path), caption=f"📄 `{m.text}`")
+#             await status.delete()
+#         finally:
+#             if path.exists(): os.remove(path)
+#             del USER_STATE[uid]
+
+#     elif st["action"] == "wait_ts":
+#         ts = m.text.replace(" call on ", ":").replace(".", ":")
+#         status = await m.reply_text("📸 **Capturing...**")
+#         dl = WORKDIR / f"s_{uid}.mp4"
+#         out = WORKDIR / f"s_{uid}.jpg"
+#         try:
+#             await st["msg"].download(str(dl))
+#             if await take_screenshot(str(dl), str(out), ts):
+#                 await m.reply_photo(str(out), caption=f"Time: {ts}")
+#                 await status.delete()
+#             else:
+#                 await status.edit("❌ Invalid timestamp.")
+#         finally:
+#             if dl.exists(): os.remove(dl)
+#             if out.exists(): os.remove(out)
+#             del USER_STATE[uid]
+@app.on_callback_query(filters.regex("^format:"))
+async def format_callbacks(c, cb: CallbackQuery):
+    _, act_type, uid_str = cb.data.split(":")
+    uid = int(uid_str) # Get the original user ID
+
+    if uid not in USER_STATE or USER_STATE[uid]["action"] != "wait_format_selection":
+        await cb.answer("❌ State expired. Please start over.", show_alert=True)
+        return
+
+    st = USER_STATE[uid]
+    file_path = pathlib.Path(st["temp_path"])
+    
+    status = await cb.message.edit_text(f"📤 **Uploading as {act_type.upper()}...**")
+
+    try:
+        if not file_path.exists():
+            raise FileNotFoundError("Temporary file not found.")
+
+        # Determine the Telegram function based on the button clicked
+        if act_type == "video":
+            await c.send_video(
+                cb.message.chat.id, 
+                str(file_path), 
+                caption=f"🎥 **Renamed:** `{st['new_name']}`"
+            )
+        elif act_type == "document":
+            await c.send_document(
+                cb.message.chat.id, 
+                str(file_path), 
+                caption=f"📄 **Renamed:** `{st['new_name']}`"
+            )
+            
+        await status.edit_text("✨ **File Sent!**")
+
+    except Exception as e:
+        await status.edit_text(f"❌ Upload failed: {e}")
+
+    finally:
+        # Clean up temporary file and state
+        if file_path.exists(): 
+            os.remove(file_path)
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+
+
 @app.on_message(filters.text & filters.private)
 async def inputs(c, m):
     uid = m.from_user.id
     if uid not in USER_STATE: return
     
     st = USER_STATE[uid]
-    if st["action"] == "wait_name":
-        path = WORKDIR / m.text.replace("/", "_")
-        status = await m.reply_text("📝 **Renaming...**")
+    
+    # ------------------ 1. RENAME INPUT (New Name) ------------------
+    if st["action"] == "wait_name_input":
+        # 1. Prepare file info and path
+        new_filename = m.text.replace("/", "_")
+        # Ensure we don't accidentally create an absolute path with the user's input
+        path = WORKDIR / new_filename 
+        
+        status = await m.reply_text("📥 **Downloading original file...**")
+        
         try:
+            # Download the original file attached to the callback message
             await st["msg"].download(str(path))
-            await m.reply_document(str(path), caption=f"📄 `{m.text}`")
-            await status.delete()
-        finally:
+            
+            # 2. Transition to format selection state
+            USER_STATE[uid] = {
+                "action": "wait_format_selection", 
+                "temp_path": str(path),
+                "new_name": new_filename
+            }
+            
+            buttons = [
+                [InlineKeyboardButton("🎥 Send as VIDEO", f"format:video:{uid}")],
+                [InlineKeyboardButton("📄 Send as FILE/Document", f"format:document:{uid}")]
+            ]
+            
+            await status.edit_text(
+                f"✅ File downloaded as `{new_filename}`.\n\n"
+                "**How should I send the renamed file?**", 
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            
+        except Exception as e:
+            await status.edit_text(f"❌ Error during download/rename: {e}")
             if path.exists(): os.remove(path)
             del USER_STATE[uid]
+        
+        return # Processing complete for rename input
 
+    # ------------------ 2. SCREENSHOT INPUT (Timestamp) ------------------
     elif st["action"] == "wait_ts":
         ts = m.text.replace(" call on ", ":").replace(".", ":")
         status = await m.reply_text("📸 **Capturing...**")
