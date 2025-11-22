@@ -18,14 +18,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "7027917459:AAG2jKW2hqkYaJj2Zuhw5bcTXNYhpDotG
 
 # --- ADMIN CONFIGURATION ---
 # IMPORTANT: Replace 123456789 with your actual Telegram User ID (numeric)
-OWNER_ID = int(os.getenv("OWNER_ID", 6075512585)) 
+OWNER_ID = int(os.getenv("OWNER_ID", 123456789)) 
 # ---------------------------------------------
 
 # Tuning
 CHUNK_SIZE = 512 * 1024 
 SPLIT_SIZE_BYTES = 1900 * 1024 * 1024 # 1.9GB limit
 WORKDIR = pathlib.Path("downloads")
-WORKDIR.mkdir(exist_ok=True)
+# WORKDIR.mkdir(exist_ok=True) # Removed from here, added to cleanup
 
 # State Management
 USER_STATE = {}
@@ -41,6 +41,16 @@ app = Client(
     workers=50,
     #ipv6=True
 )
+
+# ---------------- UTILITY FUNCTIONS ----------------
+
+def format_bytes(size: int) -> str:
+    """Formats bytes into human-readable strings (KB, MB, GB)."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
 
 # ---------------- FFMPEG TOOLS ----------------
 
@@ -86,19 +96,64 @@ async def make_gif(input_path, output_path):
     await proc.wait()
     return os.path.exists(output_path) and os.path.getsize(output_path) < 2097152
 
-async def convert_video_resolution(input_path: str, output_path: str, width: int):
-    """Converts video resolution to a specified width (maintaining aspect ratio) and encodes to h.264 MP4."""
+async def convert_video_resolution(input_path: str, output_path: str, height: int):
+    """Converts video resolution to a specified height (maintaining aspect ratio) and encodes to h.264 MP4."""
     # Use h.264 (libx264) codec, medium preset, and scale filter
     cmd = [
         "ffmpeg", "-y", "-i", input_path, 
         "-c:v", "libx264", "-crf", "23", "-preset", "medium", 
-        "-vf", f"scale={width}:-2", # -2 ensures the height is an even number, maintaining aspect ratio
+        "-vf", f"scale=-2:{height}", # -2 ensures the width is an even number, maintaining aspect ratio based on height
         "-c:a", "aac", "-b:a", "128k",
         output_path
     ]
     proc = await asyncio.create_subprocess_exec(*cmd)
     await proc.wait()
     return os.path.exists(output_path)
+
+async def update_metadata(input_path: str, output_path: str, key: str, value: str):
+    """Updates a single metadata tag without re-encoding streams."""
+    # Use -metadata tag=value and -c copy for fast modification
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path, 
+        "-metadata", f"{key}={value}", 
+        "-c", "copy",
+        output_path
+    ]
+    proc = await asyncio.create_subprocess_exec(*cmd)
+    await proc.wait()
+    return os.path.exists(output_path)
+
+async def ffprobe_metadata(input_path: str):
+    """Extracts stream and format metadata using ffprobe."""
+    # ffprobe is used to quickly read the metadata structure
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", input_path
+    ]
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    stdout, stderr = await proc.communicate()
+    
+    if proc.returncode != 0:
+        logger.error(f"FFprobe failed: {stderr.decode()}")
+        return None
+        
+    try:
+        data = json.loads(stdout.decode())
+        
+        metadata = {}
+        # Format tags (general file metadata)
+        if 'tags' in data.get('format', {}):
+            metadata['Format Tags (Global)'] = data['format']['tags']
+        
+        # Stream tags (e.g., video, audio)
+        for i, stream in enumerate(data.get('streams', [])):
+            if 'tags' in stream:
+                stream_type = stream.get('codec_type', f'Stream {i}')
+                metadata[f'{stream_type.capitalize()} Stream Tags'] = stream['tags']
+                
+        return metadata
+    except Exception as e:
+        logger.error(f"Error parsing FFprobe JSON: {e}")
+        return None
 
 # ---------------- BOT LOGIC ----------------
 
@@ -149,13 +204,22 @@ async def done_merge(c, m):
 async def restart_command(client, message):
     """
     Handles the /restart command.
+    Uses the provided decorative message but executes a clean exit for restart.
     """
     try:
-        await message.reply_text("⚠️ **Restarting...** Please wait a moment.")
+        # Use the decorative status message before exiting
+        await message.reply_text("🔄 **𝙿𝚁𝙾𝙲𝙴𝚂𝚂𝙴𝚂 𝚂𝚃𝙾𝙿𝙴𝙳. 𝙱𝙾𝚃 𝙸𝚂 𝚁𝙴𝚂𝚃𝙰𝚁𝚃𝙸𝙽𝙶...**")
+        
+        # Stop the Pyrogram client gracefully
         await client.stop()
+
+        # Terminate the Python process. The external process manager (like supervisor) 
+        # will detect this exit code (0) and start the bot script again.
         os._exit(0)
+
     except Exception as e:
         logger.error(f"Error during restart sequence: {e}")
+        # Exit with an error code to signal an abnormal termination
         os._exit(1)
 
 # ---------------- MEDIA HANDLERS ----------------
@@ -186,8 +250,9 @@ async def main_handler(c, m: Message):
     buttons = [
         [InlineKeyboardButton("📝 Rename", "act:rename"), InlineKeyboardButton("🎵 To MP3", "act:audio")],
         [InlineKeyboardButton("➕ Merge", "act:merge_start"), InlineKeyboardButton("🔪 Split (>2GB)", "act:split")],
-        [InlineKeyboardButton("🎞 GIF", "act:gif"), InlineKeyboardButton("📐 Change Res", "act:res")], # Added Resolution Change
-        [InlineKeyboardButton("📸 Screenshot", "act:ss"), InlineKeyboardButton("🖼 Set Thumb", "act:thumb")]
+        [InlineKeyboardButton("🎞 GIF", "act:gif"), InlineKeyboardButton("📐 Change Res", "act:res")], 
+        [InlineKeyboardButton("📸 Screenshot", "act:ss"), InlineKeyboardButton("🖼 Set Thumb", "act:thumb")],
+        [InlineKeyboardButton("🏷 Metadata", "act:meta")] 
     ]
     await m.reply_text(f"**File:** `{fname}`\nSelect Operation:", reply_markup=InlineKeyboardMarkup(buttons), quote=True)
 
@@ -207,14 +272,138 @@ async def callbacks(c, cb: CallbackQuery):
         await cb.answer("❌ File lost.", show_alert=True)
         return
         
-    if act == "res": # New Resolution Action
+    # --- METADATA HANDLING START ---
+    if act == "meta": 
+        await cb.answer("Processing metadata...")
+        status = await cb.message.reply_text("📥 **Downloading file to read metadata...**")
+        
+        dl = WORKDIR / f"meta_temp_{uid}.mp4" 
+
+        try:
+            await msg.download(str(dl))
+            
+            # Read metadata
+            metadata = await ffprobe_metadata(str(dl))
+            
+            # Store necessary state
+            USER_STATE[uid] = {
+                "action": "meta_menu", 
+                "msg": msg,
+                "dl_path": str(dl),
+                "metadata": metadata
+            }
+
+            buttons = [
+                [InlineKeyboardButton("👀 Show Current Tags", "act:meta_show")],
+                [InlineKeyboardButton("✍️ Set/Change Tag", "act:meta_set")],
+                [InlineKeyboardButton("❌ Cancel", "act:meta_cancel")]
+            ]
+            
+            await status.edit_text(
+                "🏷 **Metadata Options**\n\n"
+                "You can view the existing metadata or set a new tag (like 'title' or 'artist').", 
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
+        except Exception as e:
+            await status.edit_text(f"❌ Error during metadata download: {e}")
+            if dl.exists(): os.remove(dl)
+            del USER_STATE[uid]
+        return
+
+    elif act == "meta_show":
+        st = USER_STATE.get(uid)
+        if not st or st['action'] != 'meta_menu':
+            await cb.answer("❌ Please start over.", show_alert=True)
+            return
+
         await cb.answer()
-        USER_STATE[uid] = {"action": "wait_res", "msg": msg}
+        
+        metadata = st['metadata']
+        if not metadata:
+            text = "⚠️ **No readable metadata found.**"
+        else:
+            meta_str = "**Current Metadata Tags:**\n\n"
+            for section, tags in metadata.items():
+                if tags:
+                    meta_str += f"**{section}:**\n"
+                    # Sort keys alphabetically for clean display
+                    for k, v in sorted(tags.items()): 
+                        # Escape backticks in value if they exist, otherwise Python markdown gets confused
+                        safe_v = str(v).replace('`', '`')
+                        meta_str += f"`{k}`: `{safe_v}`\n"
+                    meta_str += "\n"
+            
+            # Truncate if too long for a single message
+            if len(meta_str) > 4000:
+                meta_str = meta_str[:3900] + "\n... (truncated)"
+                
+            text = meta_str
+
+        # Show metadata and allow user to proceed to set a new tag
+        buttons = [[InlineKeyboardButton("✍️ Set/Change Tag", "act:meta_set")]]
+        
+        # Edit the original message (from act:meta) or reply if it's too old
+        try:
+             await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        except:
+             await cb.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        
+        return
+        
+    elif act == "meta_set":
+        st = USER_STATE.get(uid)
+        if not st or st['action'] != 'meta_menu':
+            await cb.answer("❌ Please start over.", show_alert=True)
+            return
+            
+        await cb.answer()
+        # Change state to wait for the key
+        USER_STATE[uid]["action"] = "wait_meta_key"
+        
         await cb.message.reply_text(
-            "📐 **New Resolution?**\n\n"
-            "Enter the desired **width** in pixels (e.g., `480` for 480p, `720` for 720p).", 
+            "🔑 **Enter Metadata Key**\n\n"
+            "Examples: `title`, `artist`, `comment`, `album`.", 
             reply_markup=ForceReply()
         )
+        return
+
+    elif act == "meta_cancel":
+        st = USER_STATE.get(uid)
+        if st and st.get('dl_path') and os.path.exists(st['dl_path']): 
+            os.remove(st['dl_path'])
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        await cb.message.edit_text("❌ Metadata operation cancelled and temporary file deleted.")
+        return
+    # --- METADATA HANDLING END ---
+
+    if act == "res": # Resolution Action - Changed to show buttons
+        await cb.answer()
+        # Show buttons for common resolutions
+        buttons = [
+            # Low Resolutions
+            [InlineKeyboardButton("⬇️ 144p", "res:144"), InlineKeyboardButton("⬇️ 240p", "res:240"), InlineKeyboardButton("⬇️ 360p", "res:360")],
+            # Standard Resolutions
+            [InlineKeyboardButton("⬇️ 480p", "res:480"), InlineKeyboardButton("⬇️ 720p", "res:720"), InlineKeyboardButton("⬇️ 1080p", "res:1080")],
+            # High Resolution
+            [InlineKeyboardButton("⬇️ 1440p", "res:1440")],
+        ]
+            
+        await cb.message.edit_text(
+            "📐 **Select Output Resolution**\n\n"
+            "This will re-encode the video, which may take time. The estimated file size will be shown after conversion.", 
+            reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("❌ Cancel", "act:cancel_res")]])
+        )
+        # Store message reference to prevent issues
+        USER_STATE[uid] = {"action": "wait_res_selection", "msg": msg} 
+        return
+
+    if act == "cancel_res":
+        # Cancel button if user changes mind
+        if uid in USER_STATE and USER_STATE[uid].get('action') == 'wait_res_selection':
+            del USER_STATE[uid]
+        await cb.message.edit_text("📐 Resolution change cancelled.")
         return
 
     if act == "split":
@@ -286,6 +475,68 @@ async def callbacks(c, cb: CallbackQuery):
         await cb.answer()
         USER_STATE[uid] = {"action": "wait_thumb", "msg": msg}
         await cb.message.reply_text("🖼 **Send a Photo.**", reply_markup=ForceReply())
+
+@app.on_callback_query(filters.regex("^res:"))
+async def res_select(c, cb: CallbackQuery):
+    _, height_str = cb.data.split(":") # Now expecting height (e.g., 720)
+    uid = cb.from_user.id
+    height = int(height_str) # Target height
+
+    st = USER_STATE.get(uid)
+    if not st or st['action'] != 'wait_res_selection':
+        await cb.answer("❌ State expired. Please start over from the main menu.", show_alert=True)
+        return
+        
+    msg = st['msg']
+    
+    status = await cb.message.edit_text(f"📥 **Downloading & Converting to {height}p...**")
+    
+    dl = WORKDIR / f"res_in_{uid}.mp4"
+    # Use height in the output name
+    out_name = f"converted_{height}p_{msg.video.file_name if msg.video else 'file.mp4'}"
+    out_path = WORKDIR / out_name
+    
+    try:
+        await msg.download(str(dl))
+        await status.edit_text(f"📐 **Converting to {height}p...** This may take a while.")
+        
+        # Pass height to the conversion function
+        if await convert_video_resolution(str(dl), str(out_path), height):
+            
+            # Calculate file size and format it
+            new_size_bytes = os.path.getsize(out_path)
+            new_size_formatted = format_bytes(new_size_bytes)
+            
+            # Transition to format selection state after conversion
+            USER_STATE[uid] = {
+                "action": "wait_format_selection", 
+                "temp_path": str(out_path),
+                "new_name": out_name,
+            }
+            
+            buttons = [
+                [InlineKeyboardButton("🎥 Send as VIDEO", f"format:video:{uid}")],
+                [InlineKeyboardButton("📄 Send as FILE/Document", f"format:document:{uid}")]
+            ]
+            
+            await status.edit_text(
+                f"✅ Conversion to {height}p complete.\n"
+                f"📦 **New Size:** `{new_size_formatted}`\n\n"
+                "**How should I send the converted file?**", 
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
+        else:
+            await status.edit_text("❌ Conversion failed. Check the FFmpeg logs.")
+            del USER_STATE[uid]
+            
+    except Exception as e:
+        await status.edit_text(f"❌ Error during conversion: {e}")
+        del USER_STATE[uid]
+        
+    finally:
+        if dl.exists(): os.remove(dl)
+        # out_path is cleaned up in format_callbacks
 
 @app.on_callback_query(filters.regex("^format:"))
 async def format_callbacks(c, cb: CallbackQuery):
@@ -392,56 +643,69 @@ async def inputs(c, m):
             if out.exists(): os.remove(out)
             del USER_STATE[uid]
             
-    # ------------------ 3. RESOLUTION INPUT (Width) ------------------
-    elif st["action"] == "wait_res":
-        try:
-            width = int(m.text.strip())
-            if width <= 0: raise ValueError
-        except ValueError:
-            await m.reply_text("❌ Please enter a valid positive number for the width (e.g., 480).")
+    # ------------------ 3. METADATA KEY INPUT ------------------
+    elif st["action"] == "wait_meta_key":
+        meta_key = m.text.strip().replace(":", "_").replace("=", "_")
+        if not meta_key:
+            await m.reply_text("❌ Key cannot be empty. Please try again.")
             return
-            
-        status = await m.reply_text(f"📥 **Downloading & Converting to {width}p...**")
+
+        USER_STATE[uid]["meta_key"] = meta_key
+        USER_STATE[uid]["action"] = "wait_meta_value"
         
-        dl = WORKDIR / f"res_in_{uid}.mp4"
-        out_name = f"converted_{width}p_{st['msg'].video.file_name if st['msg'].video else 'file.mp4'}"
+        await m.reply_text(
+            f"✍️ **Enter Value for `{meta_key}`**\n\n"
+            "This will be the new value for the tag.", 
+            reply_markup=ForceReply()
+        )
+        return
+
+    # ------------------ 4. METADATA VALUE INPUT ------------------
+    elif st["action"] == "wait_meta_value":
+        meta_value = m.text.strip()
+        meta_key = st["meta_key"]
+        
+        status = await m.reply_text(f"🏷 **Updating tag `{meta_key}` to `{meta_value}`...**")
+        
+        dl_path = st["dl_path"]
+        base_name = pathlib.Path(dl_path).stem
+        ext = pathlib.Path(dl_path).suffix
+        
+        # Use a new name for the output file
+        out_name = f"{base_name}_meta_edited{ext}"
         out_path = WORKDIR / out_name
         
         try:
-            await st["msg"].download(str(dl))
-            await status.edit_text(f"📐 **Converting...** This may take a while.")
-            
-            if await convert_video_resolution(str(dl), str(out_path), width):
-                
-                # Transition to format selection state after conversion
-                USER_STATE[uid] = {
-                    "action": "wait_format_selection", 
-                    "temp_path": str(out_path),
-                    "new_name": out_name
-                }
-                
-                buttons = [
-                    [InlineKeyboardButton("🎥 Send as VIDEO", f"format:video:{uid}")],
-                    [InlineKeyboardButton("📄 Send as FILE/Document", f"format:document:{uid}")]
-                ]
-                
-                await status.edit_text(
-                    f"✅ Conversion to {width}p complete.\n\n"
-                    "**How should I send the converted file?**", 
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
+            if not os.path.exists(dl_path):
+                 raise FileNotFoundError("Original file lost.")
+                 
+            # 1. Update metadata (This is usually very fast)
+            await status.edit_text(f"🔧 **Applying new metadata tag...**")
+            success = await update_metadata(str(dl_path), str(out_path), meta_key, meta_value)
 
+            if success:
+                # 2. Upload the new file
+                await status.edit_text(f"📤 **Uploading edited file...**")
+                await c.send_document(
+                    m.chat.id, 
+                    str(out_path), 
+                    caption=f"✅ Metadata updated: `{meta_key}` set to `{meta_value}`"
+                )
+                await status.delete()
             else:
-                await status.edit_text("❌ Conversion failed. Check the FFmpeg logs.")
-                del USER_STATE[uid]
-                
+                await status.edit_text("❌ Metadata update failed.")
+            
         except Exception as e:
-            await status.edit_text(f"❌ Error during conversion: {e}")
-            del USER_STATE[uid]
+            await status.edit_text(f"❌ Error during metadata processing: {e}")
             
         finally:
-            if dl.exists(): os.remove(dl)
-            # out_path is cleaned up in format_callbacks
+            # Clean up both the original and the new file
+            if dl_path and os.path.exists(dl_path): os.remove(dl_path)
+            if out_path.exists(): os.remove(out_path)
+            
+            # Clean up state
+            if uid in USER_STATE:
+                del USER_STATE[uid]
 
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(c, m):
@@ -464,5 +728,15 @@ async def photo_handler(c, m):
             del USER_STATE[uid]
 
 if __name__ == "__main__":
+    # --- STARTUP CLEANUP ---
+    # Delete the entire downloads folder and recreate it on every bot start
+    if WORKDIR.exists():
+        logger.info(f"🧹 Cleaning up existing work directory: {WORKDIR}")
+        shutil.rmtree(WORKDIR)
+    
+    WORKDIR.mkdir(exist_ok=True)
+    logger.info(f"📂 Work directory created/recreated: {WORKDIR}")
+    # -----------------------
+    
     logger.info("🚀 Bot Started with your credentials.")
     app.run()
