@@ -16,6 +16,11 @@ API_ID = int(os.getenv("API_ID", 27972068))
 API_HASH = os.getenv("API_HASH", "6e7e2f5cdddba536b8e603b3155223c1")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7027917459:AAG2jKW2hqkYaJj2Zuhw5bcTXNYhpDotGzQ")
 
+# --- ADMIN CONFIGURATION ---
+# IMPORTANT: Replace 123456789 with your actual Telegram User ID (numeric)
+OWNER_ID = int(os.getenv("OWNER_ID", 6075512585)) 
+# ---------------------------------------------
+
 # Tuning
 CHUNK_SIZE = 512 * 1024 
 SPLIT_SIZE_BYTES = 1900 * 1024 * 1024 # 1.9GB limit
@@ -81,6 +86,20 @@ async def make_gif(input_path, output_path):
     await proc.wait()
     return os.path.exists(output_path) and os.path.getsize(output_path) < 2097152
 
+async def convert_video_resolution(input_path: str, output_path: str, width: int):
+    """Converts video resolution to a specified width (maintaining aspect ratio) and encodes to h.264 MP4."""
+    # Use h.264 (libx264) codec, medium preset, and scale filter
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path, 
+        "-c:v", "libx264", "-crf", "23", "-preset", "medium", 
+        "-vf", f"scale={width}:-2", # -2 ensures the height is an even number, maintaining aspect ratio
+        "-c:a", "aac", "-b:a", "128k",
+        output_path
+    ]
+    proc = await asyncio.create_subprocess_exec(*cmd)
+    await proc.wait()
+    return os.path.exists(output_path)
+
 # ---------------- BOT LOGIC ----------------
 
 @app.on_message(filters.command("start"))
@@ -92,7 +111,8 @@ async def start(c, m):
         "🔹 **Merge** (Stitch videos)\n"
         "🔹 **Rename & Convert**\n"
         "🔹 **Thumbnails & Screenshots**\n\n"
-        "**Send a file to begin.**"
+        "**Send a file to begin.**\n\n"
+        f"**Admin Commands:** /restart (Owner ID: `{OWNER_ID}`)"
     )
 
 @app.on_message(filters.command("done"))
@@ -123,6 +143,23 @@ async def done_merge(c, m):
         if out_path.exists(): os.remove(out_path)
         del USER_STATE[uid]
 
+# ---------------- ADMIN COMMANDS ----------------
+
+@app.on_message(filters.command("restart") & filters.user(OWNER_ID))
+async def restart_command(client, message):
+    """
+    Handles the /restart command.
+    """
+    try:
+        await message.reply_text("⚠️ **Restarting...** Please wait a moment.")
+        await client.stop()
+        os._exit(0)
+    except Exception as e:
+        logger.error(f"Error during restart sequence: {e}")
+        os._exit(1)
+
+# ---------------- MEDIA HANDLERS ----------------
+
 @app.on_message(filters.video | filters.document | filters.audio)
 async def main_handler(c, m: Message):
     uid = m.from_user.id
@@ -149,8 +186,8 @@ async def main_handler(c, m: Message):
     buttons = [
         [InlineKeyboardButton("📝 Rename", "act:rename"), InlineKeyboardButton("🎵 To MP3", "act:audio")],
         [InlineKeyboardButton("➕ Merge", "act:merge_start"), InlineKeyboardButton("🔪 Split (>2GB)", "act:split")],
-        [InlineKeyboardButton("🎞 GIF", "act:gif"), InlineKeyboardButton("📸 Screenshot", "act:ss")],
-        [InlineKeyboardButton("🖼 Set Thumb", "act:thumb")]
+        [InlineKeyboardButton("🎞 GIF", "act:gif"), InlineKeyboardButton("📐 Change Res", "act:res")], # Added Resolution Change
+        [InlineKeyboardButton("📸 Screenshot", "act:ss"), InlineKeyboardButton("🖼 Set Thumb", "act:thumb")]
     ]
     await m.reply_text(f"**File:** `{fname}`\nSelect Operation:", reply_markup=InlineKeyboardMarkup(buttons), quote=True)
 
@@ -168,6 +205,16 @@ async def callbacks(c, cb: CallbackQuery):
 
     if not msg:
         await cb.answer("❌ File lost.", show_alert=True)
+        return
+        
+    if act == "res": # New Resolution Action
+        await cb.answer()
+        USER_STATE[uid] = {"action": "wait_res", "msg": msg}
+        await cb.message.reply_text(
+            "📐 **New Resolution?**\n\n"
+            "Enter the desired **width** in pixels (e.g., `480` for 480p, `720` for 720p).", 
+            reply_markup=ForceReply()
+        )
         return
 
     if act == "split":
@@ -211,7 +258,6 @@ async def callbacks(c, cb: CallbackQuery):
 
     elif act == "gif":
         await cb.answer("Making GIF...")
-        # Logic similar to previous, simplified for length
         status = await cb.message.reply_text("🎞 **Cooking GIF...**")
         dl = WORKDIR / f"g_{uid}.mp4"
         out = WORKDIR / f"g_{uid}.gif"
@@ -228,7 +274,7 @@ async def callbacks(c, cb: CallbackQuery):
 
     elif act == "rename":
         await cb.answer()
-        USER_STATE[uid] = {"action": "wait_name", "msg": msg}
+        USER_STATE[uid] = {"action": "wait_name_input", "msg": msg}
         await cb.message.reply_text("📝 **New Name?**", reply_markup=ForceReply())
 
     elif act == "ss":
@@ -241,39 +287,6 @@ async def callbacks(c, cb: CallbackQuery):
         USER_STATE[uid] = {"action": "wait_thumb", "msg": msg}
         await cb.message.reply_text("🖼 **Send a Photo.**", reply_markup=ForceReply())
 
-# @app.on_message(filters.text & filters.private)
-# async def inputs(c, m):
-#     uid = m.from_user.id
-#     if uid not in USER_STATE: return
-    
-#     st = USER_STATE[uid]
-#     if st["action"] == "wait_name":
-#         path = WORKDIR / m.text.replace("/", "_")
-#         status = await m.reply_text("📝 **Renaming...**")
-#         try:
-#             await st["msg"].download(str(path))
-#             await m.reply_document(str(path), caption=f"📄 `{m.text}`")
-#             await status.delete()
-#         finally:
-#             if path.exists(): os.remove(path)
-#             del USER_STATE[uid]
-
-#     elif st["action"] == "wait_ts":
-#         ts = m.text.replace(" call on ", ":").replace(".", ":")
-#         status = await m.reply_text("📸 **Capturing...**")
-#         dl = WORKDIR / f"s_{uid}.mp4"
-#         out = WORKDIR / f"s_{uid}.jpg"
-#         try:
-#             await st["msg"].download(str(dl))
-#             if await take_screenshot(str(dl), str(out), ts):
-#                 await m.reply_photo(str(out), caption=f"Time: {ts}")
-#                 await status.delete()
-#             else:
-#                 await status.edit("❌ Invalid timestamp.")
-#         finally:
-#             if dl.exists(): os.remove(dl)
-#             if out.exists(): os.remove(out)
-#             del USER_STATE[uid]
 @app.on_callback_query(filters.regex("^format:"))
 async def format_callbacks(c, cb: CallbackQuery):
     _, act_type, uid_str = cb.data.split(":")
@@ -297,13 +310,13 @@ async def format_callbacks(c, cb: CallbackQuery):
             await c.send_video(
                 cb.message.chat.id, 
                 str(file_path), 
-                caption=f"🎥 **Renamed:** `{st['new_name']}`"
+                caption=f"🎥 **Renamed/Converted:** `{st['new_name']}`"
             )
         elif act_type == "document":
             await c.send_document(
                 cb.message.chat.id, 
                 str(file_path), 
-                caption=f"📄 **Renamed:** `{st['new_name']}`"
+                caption=f"📄 **Renamed/Converted:** `{st['new_name']}`"
             )
             
         await status.edit_text("✨ **File Sent!**")
@@ -328,18 +341,15 @@ async def inputs(c, m):
     
     # ------------------ 1. RENAME INPUT (New Name) ------------------
     if st["action"] == "wait_name_input":
-        # 1. Prepare file info and path
         new_filename = m.text.replace("/", "_")
-        # Ensure we don't accidentally create an absolute path with the user's input
         path = WORKDIR / new_filename 
         
         status = await m.reply_text("📥 **Downloading original file...**")
         
         try:
-            # Download the original file attached to the callback message
             await st["msg"].download(str(path))
             
-            # 2. Transition to format selection state
+            # Transition to format selection state
             USER_STATE[uid] = {
                 "action": "wait_format_selection", 
                 "temp_path": str(path),
@@ -362,7 +372,7 @@ async def inputs(c, m):
             if path.exists(): os.remove(path)
             del USER_STATE[uid]
         
-        return # Processing complete for rename input
+        return 
 
     # ------------------ 2. SCREENSHOT INPUT (Timestamp) ------------------
     elif st["action"] == "wait_ts":
@@ -381,23 +391,78 @@ async def inputs(c, m):
             if dl.exists(): os.remove(dl)
             if out.exists(): os.remove(out)
             del USER_STATE[uid]
+            
+    # ------------------ 3. RESOLUTION INPUT (Width) ------------------
+    elif st["action"] == "wait_res":
+        try:
+            width = int(m.text.strip())
+            if width <= 0: raise ValueError
+        except ValueError:
+            await m.reply_text("❌ Please enter a valid positive number for the width (e.g., 480).")
+            return
+            
+        status = await m.reply_text(f"📥 **Downloading & Converting to {width}p...**")
+        
+        dl = WORKDIR / f"res_in_{uid}.mp4"
+        out_name = f"converted_{width}p_{st['msg'].video.file_name if st['msg'].video else 'file.mp4'}"
+        out_path = WORKDIR / out_name
+        
+        try:
+            await st["msg"].download(str(dl))
+            await status.edit_text(f"📐 **Converting...** This may take a while.")
+            
+            if await convert_video_resolution(str(dl), str(out_path), width):
+                
+                # Transition to format selection state after conversion
+                USER_STATE[uid] = {
+                    "action": "wait_format_selection", 
+                    "temp_path": str(out_path),
+                    "new_name": out_name
+                }
+                
+                buttons = [
+                    [InlineKeyboardButton("🎥 Send as VIDEO", f"format:video:{uid}")],
+                    [InlineKeyboardButton("📄 Send as FILE/Document", f"format:document:{uid}")]
+                ]
+                
+                await status.edit_text(
+                    f"✅ Conversion to {width}p complete.\n\n"
+                    "**How should I send the converted file?**", 
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+
+            else:
+                await status.edit_text("❌ Conversion failed. Check the FFmpeg logs.")
+                del USER_STATE[uid]
+                
+        except Exception as e:
+            await status.edit_text(f"❌ Error during conversion: {e}")
+            del USER_STATE[uid]
+            
+        finally:
+            if dl.exists(): os.remove(dl)
+            # out_path is cleaned up in format_callbacks
 
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(c, m):
     uid = m.from_user.id
     if uid in USER_STATE and USER_STATE[uid]["action"] == "wait_thumb":
         status = await m.reply_text("🖼 **Applying...**")
+        vid_msg = USER_STATE[uid]["msg"] 
         vid = WORKDIR / f"v_{uid}.mp4"
         th = WORKDIR / f"t_{uid}.jpg"
+        
         try:
-            await asyncio.gather(USER_STATE[uid]["msg"].download(str(vid)), m.download(str(th)))
-            await c.send_video(m.chat.id, str(vid), thumb=str(th), caption="**New Thumbnail!**")
+            await asyncio.gather(vid_msg.download(str(vid)), m.download(str(th)))
+            
+            await c.send_video(m.chat.id, str(vid), thumb=str(th), caption="**New Thumbnail Applied!**")
             await status.delete()
+        
         finally:
             if vid.exists(): os.remove(vid)
             if th.exists(): os.remove(th)
             del USER_STATE[uid]
 
 if __name__ == "__main__":
-    print("🚀 Bot Started with your credentials.")
+    logger.info("🚀 Bot Started with your credentials.")
     app.run()
