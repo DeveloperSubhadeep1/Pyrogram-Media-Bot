@@ -34,7 +34,7 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workers=2,
-    ipv6=True
+    #ipv6=True
 )
 
 # ---------------- FFMPEG TOOLS ----------------
