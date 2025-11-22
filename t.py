@@ -18,7 +18,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "7027917459:AAG2jKW2hqkYaJj2Zuhw5bcTXNYhpDotG
 
 # --- ADMIN CONFIGURATION ---
 # IMPORTANT: Replace 123456789 with your actual Telegram User ID (numeric)
-OWNER_ID = int(os.getenv("OWNER_ID", 123456789)) 
+OWNER_ID = int(os.getenv("OWNER_ID", 6075512585)) 
 # ---------------------------------------------
 
 # Tuning
