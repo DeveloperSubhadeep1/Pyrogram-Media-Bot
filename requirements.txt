@@ -1,0 +1,16 @@
+pyrogram
+tgcrypto
+yt-dlp
+
+# Telegram Framework
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
+
+# Asynchronous HTTP Client
+httpx>=0.25.0
+
+# HTML Parsing
+beautifulsoup4>=4.12.2
+
+# Environment Variable Management
+python-dotenv>=1.0.0
